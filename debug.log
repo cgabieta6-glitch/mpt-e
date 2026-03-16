@@ -1,0 +1,20 @@
+2026-03-14 22:21:56.688 | INFO     | app.config.config:load_config:23 - load config from file: C:\Users\carlg\Downloads\MoneyPrinterTurbo-Extended-main\MoneyPrinterTurbo-Extended-main/config.toml
+2026-03-14 22:21:56.689 | INFO     | app.config.config:<module>:78 - MoneyPrinterTurbo v1.2.6
+[32m2026-03-14 22:22:06[0m | [1mINFO[0m | "./app\services\material.py:185":[34m search_images_wikimedia[0m - [1msearching wikimedia images: https://commons.wikimedia.org/w/api.php?search=nature landscape, with proxies: {}[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:422":[34m download_videos[0m - [1mfound 49 videos for 'nature landscape'[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:444":[34m download_videos[0m - [1mfound videos from 1 search terms, total duration: 245.0 seconds, required: 10 seconds[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:447":[34m download_videos[0m - [1mtotal unique video URLs: 49[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:455":[34m download_videos[0m - [1mtargeting max 3 videos per search term for balanced selection[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:474":[34m download_videos[0m - [1mselected 3 videos from 'nature landscape' (3/49 available)[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:480":[34m download_videos[0m - [1mselected 3 videos for download with balanced representation[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:483":[34m download_videos[0m - [1m🎯 Diversity metrics:[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:484":[34m download_videos[0m - [1m   📊 Search terms represented: 1/1[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:487":[34m download_videos[0m - [1m   📹 'nature landscape': 3 videos (100.0%)[0m
+[32m2026-03-14 22:22:08[0m | [1mINFO[0m | "./app\services\material.py:506":[34m download_videos[0m - [1mdownloading video: https://upload.wikimedia.org/wikipedia/commons/6/63/Ahaetulla_prasina%2C_oriental_whipsnake_-_Kaeng_Krachan_National_Park.jpg[0m
+[32m2026-03-14 22:22:11[0m | [33m[1mWARNING[0m | "./app\services\material.py:390":[34m save_image_as_video[0m - [33m[1minvalid image or conversion failed: https://upload.wikimedia.org/wikipedia/commons/6/63/Ahaetulla_prasina%2C_oriental_whipsnake_-_Kaeng_Krachan_National_Park.jpg => 'ImageClip' object has no attribute 'resize'[0m
+[32m2026-03-14 22:22:11[0m | [1mINFO[0m | "./app\services\material.py:506":[34m download_videos[0m - [1mdownloading video: https://upload.wikimedia.org/wikipedia/commons/f/fb/Large_cloud_over_Mexican_landscape.jpg[0m
+[32m2026-03-14 22:22:13[0m | [33m[1mWARNING[0m | "./app\services\material.py:390":[34m save_image_as_video[0m - [33m[1minvalid image or conversion failed: https://upload.wikimedia.org/wikipedia/commons/f/fb/Large_cloud_over_Mexican_landscape.jpg => 'ImageClip' object has no attribute 'resize'[0m
+[32m2026-03-14 22:22:13[0m | [1mINFO[0m | "./app\services\material.py:506":[34m download_videos[0m - [1mdownloading video: https://upload.wikimedia.org/wikipedia/commons/e/e9/Azerbajiani_landscape_-_Another_version.jpg[0m
+[32m2026-03-14 22:22:14[0m | [33m[1mWARNING[0m | "./app\services\material.py:390":[34m save_image_as_video[0m - [33m[1minvalid image or conversion failed: https://upload.wikimedia.org/wikipedia/commons/e/e9/Azerbajiani_landscape_-_Another_version.jpg => [Errno 1094995529] Invalid data found when processing input: 'avcodec_send_packet()'[0m
+[32m2026-03-14 22:22:14[0m | [32m[1mSUCCESS[0m | "./app\services\material.py:534":[34m download_videos[0m - [32m[1mdownloaded 0 videos[0m
+[32m2026-03-14 22:22:14[0m | [1mINFO[0m | "./app\services\material.py:535":[34m download_videos[0m - [1m🎯 Final diversity: 0 unique URLs downloaded[0m
