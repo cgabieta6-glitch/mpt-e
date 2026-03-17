@@ -21,7 +21,7 @@ This fork includes **Chatterbox TTS** - a completely free alternative to Azure T
 **Key advantages:**
 - **No API costs**: Completely free to use, no rate limits
 - **Voice cloning**: Clone any voice using 10-60 seconds of reference audio
-- **Word-level timing**: Perfect subtitle synchronization with WhisperX integration
+- **Subtitle timing**: Good sentence-level timing by default, optional WhisperX word-level alignment
 - **Automatic speed control**: Configurable speech pacing via environment variables
 
 
