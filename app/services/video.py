@@ -38,7 +38,8 @@ from app.services import semantic_video
 
 # High-quality video encoding settings
 audio_codec = "aac"
-video_codec = "libx264"
+# Default to NVENC on NVIDIA GPUs; fallback to libx264 is handled in _write_videofile_with_fallback
+video_codec = "h264_nvenc"
 fps = 30
 
 # High-quality encoding parameters
@@ -47,14 +48,16 @@ audio_bitrate = "320k"   # High audio bitrate
 crf = 18                 # Constant Rate Factor - lower = higher quality (18-23 is excellent range)
 preset = "medium"        # Balance between encoding speed and compression efficiency
 
+GPU_HWACCEL_FLAGS = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+
 # FFmpeg parameters for maximum quality
-quality_params = [
+quality_params = GPU_HWACCEL_FLAGS + [
     "-crf", str(crf),
     "-preset", preset,
     "-profile:v", "high",
     "-level", "4.1",
     "-pix_fmt", "yuv420p",
-    "-movflags", "+faststart"
+    "-movflags", "+faststart",
 ]
 
 # Fast encoding parameters used by clip preprocessing/combining.
@@ -62,7 +65,7 @@ fast_preset = "veryfast"
 fast_crf = 23
 fast_video_bitrate = "3500k"
 fast_audio_bitrate = "128k"
-fast_quality_params = [
+fast_quality_params = GPU_HWACCEL_FLAGS + [
     "-crf", str(fast_crf),
     "-preset", fast_preset,
     "-tune", "fastdecode",
@@ -83,18 +86,21 @@ def _cuda_video_enabled() -> bool:
 
 def _write_videofile_with_fallback(clip, output_path: str, **kwargs):
     """Write video using optional NVENC, with automatic CPU fallback."""
-    use_cuda = _cuda_video_enabled()
-    codec = kwargs.pop("codec", video_codec)
+    use_cuda = True  # Prefer NVENC by default on capable GPUs
+    requested_codec = kwargs.pop("codec", video_codec)
     ffmpeg_params = kwargs.pop("ffmpeg_params", quality_params)
 
+    # Ensure hardware acceleration flags are present for GPU path
+    gpu_ffmpeg_params = (
+        ffmpeg_params
+        if any(flag in ffmpeg_params for flag in GPU_HWACCEL_FLAGS)
+        else GPU_HWACCEL_FLAGS + ffmpeg_params
+    )
+    cpu_ffmpeg_params = [p for p in ffmpeg_params if p not in GPU_HWACCEL_FLAGS]
+
     if use_cuda:
-        gpu_ffmpeg_params = [
-            "-preset", "p4",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-        ]
         try:
-            logger.info("VIDEO_USE_CUDA=1 detected, trying NVENC encoding")
+            logger.info("Attempting NVENC encoding (h264_nvenc) with CUDA hwaccel")
             return clip.write_videofile(
                 output_path,
                 codec="h264_nvenc",
@@ -106,8 +112,8 @@ def _write_videofile_with_fallback(clip, output_path: str, **kwargs):
 
     return clip.write_videofile(
         output_path,
-        codec=codec,
-        ffmpeg_params=ffmpeg_params,
+        codec=requested_codec if requested_codec != "h264_nvenc" else "libx264",
+        ffmpeg_params=cpu_ffmpeg_params or ["-preset", preset, "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         **kwargs,
     )
 
@@ -151,20 +157,51 @@ def close_clip(clip):
         
     try:
         # close main resources
+        if hasattr(clip, 'close'):
+            try:
+                clip.close()
+            except Exception:
+                pass
+                
         if hasattr(clip, 'reader') and clip.reader is not None:
-            clip.reader.close()
+            try:
+                clip.reader.close()
+            except Exception:
+                pass
             
         # close audio resources
         if hasattr(clip, 'audio') and clip.audio is not None:
+            if hasattr(clip.audio, 'close'):
+                try:
+                    clip.audio.close()
+                except Exception:
+                    pass
             if hasattr(clip.audio, 'reader') and clip.audio.reader is not None:
-                clip.audio.reader.close()
-            del clip.audio
+                try:
+                    clip.audio.reader.close()
+                except Exception:
+                    pass
+            try:
+                del clip.audio
+            except Exception:
+                pass
             
         # close mask resources
         if hasattr(clip, 'mask') and clip.mask is not None:
+            if hasattr(clip.mask, 'close'):
+                try:
+                    clip.mask.close()
+                except Exception:
+                    pass
             if hasattr(clip.mask, 'reader') and clip.mask.reader is not None:
-                clip.mask.reader.close()
-            del clip.mask
+                try:
+                    clip.mask.reader.close()
+                except Exception:
+                    pass
+            try:
+                del clip.mask
+            except Exception:
+                pass
             
         # handle child clips in composite clips
         if hasattr(clip, 'clips') and clip.clips:
@@ -179,7 +216,10 @@ def close_clip(clip):
     except Exception as e:
         logger.error(f"failed to close clip: {str(e)}")
     
-    del clip
+    try:
+        del clip
+    except Exception:
+        pass
     gc.collect()
 
 def delete_files(files: List[str] | str):
@@ -221,12 +261,16 @@ def combine_videos(
     params: VideoParams = None
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
-    audio_duration = audio_clip.duration
-    logger.info(f"audio duration: {audio_duration} seconds")
-    # Required duration of each clip
-    req_dur = audio_duration / len(video_paths)
-    req_dur = max_clip_duration
-    logger.info(f"maximum clip duration: {req_dur} seconds")
+    try:
+        audio_duration = audio_clip.duration
+        logger.info(f"audio duration: {audio_duration} seconds")
+        # Required duration of each clip
+        req_dur = audio_duration / len(video_paths)
+        req_dur = max_clip_duration
+        logger.info(f"maximum clip duration: {req_dur} seconds")
+    finally:
+        audio_clip.close()
+        del audio_clip
     output_dir = os.path.dirname(combined_video_path)
 
     video_width, video_height = _fast_target_resolution(video_aspect)
@@ -286,7 +330,8 @@ def combine_videos(
             logger.debug(f"processing semantic clip {i+1}: {os.path.basename(video_path)}, target duration: {target_duration:.2f}s")
             
             try:
-                clip = VideoFileClip(video_path)
+                orig_clip = VideoFileClip(video_path)
+                clip = orig_clip
                 clip_duration = min(clip.duration, target_duration)
                 
                 # Random start time for variety
@@ -352,6 +397,7 @@ def combine_videos(
                 )
                 
                 close_clip(clip)
+                close_clip(orig_clip)
                 
                 processed_clips.append(SubClippedVideoClip(file_path=clip_file, duration=clip_duration, width=clip_w, height=clip_h))
                 video_duration += clip_duration
@@ -394,7 +440,8 @@ def combine_videos(
             logger.debug(f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, current duration: {video_duration:.2f}s, remaining: {audio_duration - video_duration:.2f}s")
             
             try:
-                clip = VideoFileClip(subclipped_item.file_path).subclipped(subclipped_item.start_time, subclipped_item.end_time)
+                orig_clip = VideoFileClip(subclipped_item.file_path)
+                clip = orig_clip.subclipped(subclipped_item.start_time, subclipped_item.end_time)
                 clip_duration = clip.duration
                 # Not all videos are same size, so we need to resize them
                 clip_w, clip_h = clip.size
@@ -456,6 +503,7 @@ def combine_videos(
                 )
                 
                 close_clip(clip)
+                close_clip(orig_clip)
             
                 processed_clips.append(SubClippedVideoClip(file_path=clip_file, duration=clip.duration, width=clip_w, height=clip_h))
                 video_duration += clip.duration
@@ -520,7 +568,7 @@ def combine_videos(
                     video_duration += clip.duration
                 logger.info(f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, looped {len(processed_clips)-len(base_clips)} clips")
      
-    # merge video clips using direct concatenation to avoid quality degradation
+    # merge video clips using small batches to keep VRAM footprint low
     logger.info("starting clip merging process")
     if not processed_clips:
         logger.warning("no clips available for merging")
@@ -533,52 +581,86 @@ def combine_videos(
         delete_files([processed_clips[0].file_path])
         logger.info("video combining completed")
         return combined_video_path
-    
-    # Load all clips at once and concatenate in single operation to preserve quality
-    logger.info(f"loading {len(processed_clips)} clips for direct concatenation")
-    clips_to_merge = []
-    
-    try:
-        for i, clip_info in enumerate(processed_clips):
-            logger.info(f"loading clip {i+1}/{len(processed_clips)}: {os.path.basename(clip_info.file_path)}")
-            clip = VideoFileClip(clip_info.file_path)
-            clips_to_merge.append(clip)
-        
-        # Concatenate all clips in single operation - NO QUALITY LOSS!
-        logger.info("concatenating all clips in single operation")
-        final_clip = concatenate_videoclips(clips_to_merge)
-        
-        # Write final result with high quality settings
-        logger.info("writing final concatenated video with high quality")
-        _write_videofile_with_fallback(
-            final_clip,
-            combined_video_path,
-            threads=threads,
-            logger=None,
-            temp_audiofile_path=output_dir,
-            audio_codec=audio_codec,
-            fps=fps,
-            bitrate=fast_video_bitrate,
-            audio_bitrate=fast_audio_bitrate,
-            ffmpeg_params=fast_quality_params,
-        )
-        
-        # Clean up clips
-        for clip in clips_to_merge:
-            close_clip(clip)
-        close_clip(final_clip)
-        
-    except Exception as e:
-        logger.error(f"failed to concatenate clips: {str(e)}")
-        # Fallback to progressive merging if direct concatenation fails
-        logger.warning("falling back to progressive merging")
-        return _progressive_merge_fallback(processed_clips, combined_video_path, output_dir, threads)
-    
-    # clean temp files
-    clip_files = [clip.file_path for clip in processed_clips]
-    delete_files(clip_files)
-            
+
+    merged_result = _batch_merge_clips(
+        processed_clips,
+        combined_video_path,
+        output_dir,
+        threads=threads,
+        batch_size=2,
+    )
     logger.info("video combining completed")
+    return merged_result
+
+
+def _batch_merge_clips(processed_clips, combined_video_path, output_dir, threads, batch_size=2):
+    """
+    Merge clips in small batches to limit simultaneous VRAM usage.
+    Keeps at most `batch_size` clips in memory at once and frees memory immediately after writing.
+    """
+    working_clips = list(processed_clips)
+    batch_counter = 0
+
+    while len(working_clips) > 1:
+        next_round = []
+        for i in range(0, len(working_clips), batch_size):
+            batch = working_clips[i : i + batch_size]
+            if len(batch) == 1:
+                next_round.append(batch[0])
+                continue
+
+            # load only the current batch
+            loaded_batch = []
+            try:
+                for clip_info in batch:
+                    loaded_clip = VideoFileClip(clip_info.file_path)
+                    loaded_batch.append(loaded_clip)
+
+                merged_clip = concatenate_videoclips(loaded_batch)
+                batch_file = f"{output_dir}/temp-merged-batch-{batch_counter}.mp4"
+
+                _write_videofile_with_fallback(
+                    merged_clip,
+                    batch_file,
+                    threads=threads,
+                    logger=None,
+                    temp_audiofile_path=output_dir,
+                    audio_codec=audio_codec,
+                    fps=fps,
+                    bitrate=fast_video_bitrate,
+                    audio_bitrate=fast_audio_bitrate,
+                    ffmpeg_params=fast_quality_params,
+                )
+
+                # Close and free ASAP
+                for clip in loaded_batch:
+                    close_clip(clip)
+                close_clip(merged_clip)
+
+                # Delete source temp files for this batch to free disk/GPU memory
+                delete_files([c.file_path for c in batch])
+
+                duration_sum = sum(c.duration for c in batch if hasattr(c, "duration") and c.duration)
+                merged_info = SubClippedVideoClip(
+                    file_path=batch_file,
+                    duration=duration_sum,
+                    width=getattr(loaded_batch[0], "w", None) if loaded_batch else None,
+                    height=getattr(loaded_batch[0], "h", None) if loaded_batch else None,
+                )
+                next_round.append(merged_info)
+                batch_counter += 1
+            except Exception as e:
+                logger.error(f"failed to merge batch: {str(e)}")
+                # Clean up loaded clips on error
+                for clip in loaded_batch:
+                    close_clip(clip)
+                continue
+
+        working_clips = next_round
+
+    final_path = working_clips[0].file_path
+    if final_path != combined_video_path:
+        shutil.move(final_path, combined_video_path)
     return combined_video_path
 
 
@@ -1008,8 +1090,10 @@ def generate_video(
             _clip = _clip.with_position(("center", "center"))
         return _clip
 
-    video_clip = VideoFileClip(video_path).without_audio()
-    audio_clip = AudioFileClip(audio_path).with_effects(
+    orig_video_clip = VideoFileClip(video_path)
+    video_clip = orig_video_clip.without_audio()
+    orig_audio_clip = AudioFileClip(audio_path)
+    audio_clip = orig_audio_clip.with_effects(
         [afx.MultiplyVolume(params.voice_volume)]
     )
 
@@ -1061,19 +1145,32 @@ def generate_video(
             logger.error(f"failed to add bgm: {str(e)}")
 
     video_clip = video_clip.with_audio(audio_clip)
-    _write_videofile_with_fallback(
-        video_clip,
-        output_file,
-        audio_codec=audio_codec,
-        temp_audiofile_path=output_dir,
-        threads=params.n_threads or 2,
-        logger=None,
-        fps=fps,
-        bitrate=video_bitrate,
-        audio_bitrate=audio_bitrate,
-    )
-    video_clip.close()
-    del video_clip
+    try:
+        _write_videofile_with_fallback(
+            video_clip,
+            output_file,
+            audio_codec=audio_codec,
+            temp_audiofile_path=output_dir,
+            threads=params.n_threads or 2,
+            logger=None,
+            fps=fps,
+            bitrate=video_bitrate,
+            audio_bitrate=audio_bitrate,
+        )
+    finally:
+        # Explicitly release GPU/CPU resources
+        close_clip(video_clip)
+        close_clip(orig_video_clip)
+        close_clip(audio_clip)
+        close_clip(orig_audio_clip)
+        if "bgm_clip" in locals():
+            close_clip(bgm_clip)
+        try:
+            del video_clip
+            del orig_video_clip
+            gc.collect()
+        except:
+            pass
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
@@ -1091,6 +1188,7 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
         height = clip.size[1]
         if width < 480 or height < 480:
             logger.warning(f"low resolution material: {width}x{height}, minimum 480x480 required")
+            close_clip(clip)
             continue
 
         if ext in const.FILE_TYPE_IMAGES:
@@ -1124,7 +1222,12 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 bitrate=video_bitrate,
                 audio_bitrate=audio_bitrate,
             )
+            close_clip(final_clip)
+            close_clip(zoom_clip)
             close_clip(clip)
             material.url = video_file
             logger.success(f"image processed: {video_file}")
+        else:
+            # Ensure non-image clips are released quickly
+            close_clip(clip)
     return materials
