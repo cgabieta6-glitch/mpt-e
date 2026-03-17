@@ -33,4 +33,4 @@ if not defined CHATTERBOX_CHUNK_THRESHOLD set CHATTERBOX_CHUNK_THRESHOLD=800
 echo Chatterbox TTS: cfg_weight=%CHATTERBOX_CFG_WEIGHT%, chunk_threshold=%CHATTERBOX_CHUNK_THRESHOLD%
 
 rem set HF_ENDPOINT=https://hf-mirror.com
-streamlit run .\webui\Main.py --browser.gatherUsageStats=False --server.enableCORS=True
+streamlit run .\webui\Main.py --browser.gatherUsageStats=False --server.fileWatcherType=none --server.enableCORS=True
