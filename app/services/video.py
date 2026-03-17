@@ -90,21 +90,28 @@ def _write_videofile_with_fallback(clip, output_path: str, **kwargs):
     requested_codec = kwargs.pop("codec", video_codec)
     ffmpeg_params = kwargs.pop("ffmpeg_params", quality_params)
 
-    # Ensure hardware acceleration flags are present for GPU path
-    gpu_ffmpeg_params = (
-        ffmpeg_params
-        if any(flag in ffmpeg_params for flag in GPU_HWACCEL_FLAGS)
-        else GPU_HWACCEL_FLAGS + ffmpeg_params
-    )
-    cpu_ffmpeg_params = [p for p in ffmpeg_params if p not in GPU_HWACCEL_FLAGS]
+    # Strip hardware acceleration flags from output params
+    # MoviePy's ffmpeg_params are appended to output block, but -hwaccel is strictly an input option.
+    safe_ffmpeg_params = []
+    skip_next = False
+    for p in ffmpeg_params:
+        if skip_next:
+            skip_next = False
+            continue
+        if p in ("-hwaccel", "-hwaccel_output_format"):
+            skip_next = True
+            continue
+        safe_ffmpeg_params.append(p)
+
+    cpu_ffmpeg_params = safe_ffmpeg_params
 
     if use_cuda:
         try:
-            logger.info("Attempting NVENC encoding (h264_nvenc) with CUDA hwaccel")
+            logger.info("Attempting NVENC encoding (h264_nvenc)")
             return clip.write_videofile(
                 output_path,
                 codec="h264_nvenc",
-                ffmpeg_params=gpu_ffmpeg_params,
+                ffmpeg_params=safe_ffmpeg_params,
                 **kwargs,
             )
         except Exception as e:
