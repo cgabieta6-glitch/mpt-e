@@ -57,6 +57,20 @@ quality_params = [
     "-movflags", "+faststart"
 ]
 
+# Fast encoding parameters used by clip preprocessing/combining.
+fast_preset = "veryfast"
+fast_crf = 23
+fast_video_bitrate = "3500k"
+fast_audio_bitrate = "128k"
+fast_quality_params = [
+    "-crf", str(fast_crf),
+    "-preset", fast_preset,
+    "-tune", "fastdecode",
+    "-pix_fmt", "yuv420p",
+    "-movflags", "+faststart",
+    "-sws_flags", "fast_bilinear",
+]
+
 
 def _is_truthy(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
@@ -70,6 +84,8 @@ def _cuda_video_enabled() -> bool:
 def _write_videofile_with_fallback(clip, output_path: str, **kwargs):
     """Write video using optional NVENC, with automatic CPU fallback."""
     use_cuda = _cuda_video_enabled()
+    codec = kwargs.pop("codec", video_codec)
+    ffmpeg_params = kwargs.pop("ffmpeg_params", quality_params)
 
     if use_cuda:
         gpu_ffmpeg_params = [
@@ -90,10 +106,28 @@ def _write_videofile_with_fallback(clip, output_path: str, **kwargs):
 
     return clip.write_videofile(
         output_path,
-        codec=video_codec,
-        ffmpeg_params=quality_params,
+        codec=codec,
+        ffmpeg_params=ffmpeg_params,
         **kwargs,
     )
+
+
+def _fast_target_resolution(video_aspect: VideoAspect) -> tuple[int, int]:
+    """Use a 720p-equivalent target to reduce resize and encode cost."""
+    aspect = VideoAspect(video_aspect)
+    if aspect.value == VideoAspect.landscape.value:
+        return 1280, 720
+    if aspect.value == VideoAspect.portrait.value:
+        return 720, 1280
+    if aspect.value == VideoAspect.square.value:
+        return 720, 720
+    return 720, 1280
+
+
+def _resolve_threads(requested_threads: int) -> int:
+    cpu_threads = os.cpu_count() or 2
+    return max(requested_threads or 2, min(cpu_threads, 8))
+
 
 class SubClippedVideoClip:
     def __init__(self, file_path, start_time=None, end_time=None, width=None, height=None, duration=None):
@@ -195,8 +229,9 @@ def combine_videos(
     logger.info(f"maximum clip duration: {req_dur} seconds")
     output_dir = os.path.dirname(combined_video_path)
 
-    aspect = VideoAspect(video_aspect)
-    video_width, video_height = aspect.to_resolution()
+    video_width, video_height = _fast_target_resolution(video_aspect)
+    threads = _resolve_threads(threads)
+    logger.info(f"combine target resolution: {video_width}x{video_height}, threads: {threads}")
 
     # Check if semantic mode is enabled
     if video_concat_mode.value == "semantic" and script:
@@ -310,8 +345,10 @@ def combine_videos(
                     clip_file,
                     logger=None,
                     fps=fps,
-                    bitrate=video_bitrate,
-                    audio_bitrate=audio_bitrate,
+                    threads=threads,
+                    audio=False,
+                    bitrate=fast_video_bitrate,
+                    ffmpeg_params=fast_quality_params,
                 )
                 
                 close_clip(clip)
@@ -412,8 +449,10 @@ def combine_videos(
                     clip_file,
                     logger=None,
                     fps=fps,
-                    bitrate=video_bitrate,
-                    audio_bitrate=audio_bitrate,
+                    threads=threads,
+                    audio=False,
+                    bitrate=fast_video_bitrate,
+                    ffmpeg_params=fast_quality_params,
                 )
                 
                 close_clip(clip)
@@ -519,8 +558,9 @@ def combine_videos(
             temp_audiofile_path=output_dir,
             audio_codec=audio_codec,
             fps=fps,
-            bitrate=video_bitrate,
-            audio_bitrate=audio_bitrate,
+            bitrate=fast_video_bitrate,
+            audio_bitrate=fast_audio_bitrate,
+            ffmpeg_params=fast_quality_params,
         )
         
         # Clean up clips
@@ -575,8 +615,9 @@ def _progressive_merge_fallback(processed_clips, combined_video_path, output_dir
                 temp_audiofile_path=output_dir,
                 audio_codec=audio_codec,
                 fps=fps,
-                bitrate=video_bitrate,
-                audio_bitrate=audio_bitrate,
+                bitrate=fast_video_bitrate,
+                audio_bitrate=fast_audio_bitrate,
+                ffmpeg_params=fast_quality_params,
             )
             close_clip(base_clip)
             close_clip(next_clip)
