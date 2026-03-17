@@ -185,7 +185,25 @@ def search_wikimedia_materials(
 
         try:
             r = requests.get(query_url, params=params, headers=headers, proxies=config.proxy, verify=False, timeout=(30, 60))
-            response = r.json()
+            r.raise_for_status()
+
+            content_type = (r.headers.get("content-type", "") or "").lower()
+            if "json" not in content_type:
+                snippet = (r.text or "")[:200].replace("\n", " ")
+                logger.error(
+                    f"wikimedia {filetype} response is not JSON (status={r.status_code}, content-type={content_type}): {snippet}"
+                )
+                return []
+
+            try:
+                response = r.json()
+            except ValueError:
+                snippet = (r.text or "")[:200].replace("\n", " ")
+                logger.error(
+                    f"wikimedia {filetype} returned invalid JSON (status={r.status_code}): {snippet}"
+                )
+                return []
+
             items = []
             
             if "query" not in response or "pages" not in response["query"]:
@@ -451,6 +469,15 @@ def download_videos(
                 minimum_duration=max_clip_duration,
                 video_aspect=video_aspect,
             )
+            if not video_items:
+                logger.warning(
+                    f"wikimedia returned no materials for '{search_term}', falling back to pexels for this term"
+                )
+                video_items = search_videos_pexels(
+                    search_term=search_term,
+                    minimum_duration=max_clip_duration,
+                    video_aspect=video_aspect,
+                )
         else:
             video_items = search_videos_pexels(
                 search_term=search_term,
