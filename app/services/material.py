@@ -470,14 +470,26 @@ def download_videos(
                 video_aspect=video_aspect,
             )
             if not video_items:
-                logger.warning(
-                    f"wikimedia returned no materials for '{search_term}', falling back to pexels for this term"
-                )
-                video_items = search_videos_pexels(
-                    search_term=search_term,
-                    minimum_duration=max_clip_duration,
-                    video_aspect=video_aspect,
-                )
+                pexels_keys = config.app.get("pexels_api_keys") or []
+                if pexels_keys:
+                    logger.warning(
+                        f"wikimedia returned no materials for '{search_term}', falling back to pexels for this term"
+                    )
+                    try:
+                        video_items = search_videos_pexels(
+                            search_term=search_term,
+                            minimum_duration=max_clip_duration,
+                            video_aspect=video_aspect,
+                        )
+                    except ValueError as e:
+                        logger.error(
+                            f"pexels fallback is configured but unavailable for '{search_term}': {e}"
+                        )
+                        video_items = []
+                else:
+                    logger.warning(
+                        f"wikimedia returned no materials for '{search_term}', and pexels_api_keys is not set; skipping fallback"
+                    )
         else:
             video_items = search_videos_pexels(
                 search_term=search_term,
