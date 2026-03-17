@@ -176,8 +176,7 @@ def search_wikimedia_materials(
             "gsrnamespace": 6,  # 6 is File namespace
             "gsrlimit": 50,
             "prop": "imageinfo",
-            "iiprop": "url|size|extmetadata",
-            "iiurlwidth": 640
+            "iiprop": "url|size|extmetadata"
         }
         
         query_url = "https://commons.wikimedia.org/w/api.php"
@@ -219,7 +218,7 @@ def search_wikimedia_materials(
                 item.url = url
                 item.duration = minimum_duration
                 item.is_image = is_image
-                item.thumbnail_url = info.get("thumburl", "") or ""
+                item.thumbnail_url = url
                 
                 items.append(item)
 
