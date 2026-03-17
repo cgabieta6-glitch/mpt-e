@@ -60,13 +60,19 @@ except ImportError as e:
     CHATTERBOX_AVAILABLE = False
     logger.warning(f"Chatterbox runtime dependencies not available: {e}")
 
-try:
-    import whisperx  # type: ignore
-    WHISPERX_AVAILABLE = True
-    logger.info("WhisperX is available for word-level alignment")
-except ImportError as e:
-    WHISPERX_AVAILABLE = False
-    logger.warning(f"WhisperX not available, will use sentence-level subtitle timing: {e}")
+# WhisperX can be heavy and is optional for Chatterbox.
+# Keep it disabled by default so Chatterbox TTS does not depend on it.
+WHISPERX_AVAILABLE = False
+if os.environ.get("CHATTERBOX_ENABLE_WHISPERX", "0") == "1":
+    try:
+        import whisperx  # type: ignore
+        WHISPERX_AVAILABLE = True
+        logger.info("WhisperX is enabled for word-level alignment")
+    except Exception as e:
+        WHISPERX_AVAILABLE = False
+        logger.warning(f"WhisperX failed to load, using sentence-level subtitle timing: {e}")
+else:
+    logger.info("WhisperX is disabled for Chatterbox TTS (CHATTERBOX_ENABLE_WHISPERX != 1)")
 
 # Global Chatterbox model instance
 chatterbox_model = None
