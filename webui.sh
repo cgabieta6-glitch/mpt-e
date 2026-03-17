@@ -10,4 +10,4 @@
 # Set up CUDA/cuDNN environment
 source "$(dirname "$0")/setup_cuda_env.sh"
 
-streamlit run ./webui/Main.py --browser.serverAddress="0.0.0.0" --server.enableCORS=True --browser.gatherUsageStats=False
+streamlit run ./webui/Main.py --browser.serverAddress="0.0.0.0" --server.enableCORS=True --browser.gatherUsageStats=False --server.fileWatcherType=none
