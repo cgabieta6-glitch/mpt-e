@@ -57,6 +57,44 @@ quality_params = [
     "-movflags", "+faststart"
 ]
 
+
+def _is_truthy(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cuda_video_enabled() -> bool:
+    """Opt-in CUDA/NVENC encoder path for MoviePy/FFmpeg writes."""
+    return _is_truthy(os.environ.get("VIDEO_USE_CUDA", "0"))
+
+
+def _write_videofile_with_fallback(clip, output_path: str, **kwargs):
+    """Write video using optional NVENC, with automatic CPU fallback."""
+    use_cuda = _cuda_video_enabled()
+
+    if use_cuda:
+        gpu_ffmpeg_params = [
+            "-preset", "p4",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+        ]
+        try:
+            logger.info("VIDEO_USE_CUDA=1 detected, trying NVENC encoding")
+            return clip.write_videofile(
+                output_path,
+                codec="h264_nvenc",
+                ffmpeg_params=gpu_ffmpeg_params,
+                **kwargs,
+            )
+        except Exception as e:
+            logger.warning(f"NVENC encoding failed, falling back to CPU libx264: {e}")
+
+    return clip.write_videofile(
+        output_path,
+        codec=video_codec,
+        ffmpeg_params=quality_params,
+        **kwargs,
+    )
+
 class SubClippedVideoClip:
     def __init__(self, file_path, start_time=None, end_time=None, width=None, height=None, duration=None):
         self.file_path = file_path
@@ -267,14 +305,13 @@ def combine_videos(
                 
                 # Write clip to temp file
                 clip_file = f"{output_dir}/temp-semantic-clip-{i+1}.mp4"
-                clip.write_videofile(
-                    clip_file, 
-                    logger=None, 
-                    fps=fps, 
-                    codec=video_codec,
+                _write_videofile_with_fallback(
+                    clip,
+                    clip_file,
+                    logger=None,
+                    fps=fps,
                     bitrate=video_bitrate,
                     audio_bitrate=audio_bitrate,
-                    ffmpeg_params=quality_params
                 )
                 
                 close_clip(clip)
@@ -370,14 +407,13 @@ def combine_videos(
                     
                 # wirte clip to temp file
                 clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
-                clip.write_videofile(
-                    clip_file, 
-                    logger=None, 
-                    fps=fps, 
-                    codec=video_codec,
+                _write_videofile_with_fallback(
+                    clip,
+                    clip_file,
+                    logger=None,
+                    fps=fps,
                     bitrate=video_bitrate,
                     audio_bitrate=audio_bitrate,
-                    ffmpeg_params=quality_params
                 )
                 
                 close_clip(clip)
@@ -475,17 +511,16 @@ def combine_videos(
         
         # Write final result with high quality settings
         logger.info("writing final concatenated video with high quality")
-        final_clip.write_videofile(
+        _write_videofile_with_fallback(
+            final_clip,
             combined_video_path,
             threads=threads,
             logger=None,
             temp_audiofile_path=output_dir,
             audio_codec=audio_codec,
             fps=fps,
-            codec=video_codec,
             bitrate=video_bitrate,
             audio_bitrate=audio_bitrate,
-            ffmpeg_params=quality_params
         )
         
         # Clean up clips
@@ -532,17 +567,16 @@ def _progressive_merge_fallback(processed_clips, combined_video_path, output_dir
             merged_clip = concatenate_videoclips([base_clip, next_clip])
 
             # save merged result to temp file
-            merged_clip.write_videofile(
-                filename=temp_merged_next,
+            _write_videofile_with_fallback(
+                merged_clip,
+                temp_merged_next,
                 threads=threads,
                 logger=None,
                 temp_audiofile_path=output_dir,
                 audio_codec=audio_codec,
                 fps=fps,
-                codec=video_codec,
                 bitrate=video_bitrate,
                 audio_bitrate=audio_bitrate,
-                ffmpeg_params=quality_params
             )
             close_clip(base_clip)
             close_clip(next_clip)
@@ -986,17 +1020,16 @@ def generate_video(
             logger.error(f"failed to add bgm: {str(e)}")
 
     video_clip = video_clip.with_audio(audio_clip)
-    video_clip.write_videofile(
+    _write_videofile_with_fallback(
+        video_clip,
         output_file,
         audio_codec=audio_codec,
         temp_audiofile_path=output_dir,
         threads=params.n_threads or 2,
         logger=None,
         fps=fps,
-        codec=video_codec,
         bitrate=video_bitrate,
         audio_bitrate=audio_bitrate,
-        ffmpeg_params=quality_params
     )
     video_clip.close()
     del video_clip
@@ -1042,14 +1075,13 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
 
             # Output the video to a file.
             video_file = f"{material.url}.mp4"
-            final_clip.write_videofile(
-                video_file, 
-                fps=30, 
+            _write_videofile_with_fallback(
+                final_clip,
+                video_file,
+                fps=30,
                 logger=None,
-                codec=video_codec,
                 bitrate=video_bitrate,
                 audio_bitrate=audio_bitrate,
-                ffmpeg_params=quality_params
             )
             close_clip(clip)
             material.url = video_file
