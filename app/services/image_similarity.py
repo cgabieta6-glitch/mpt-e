@@ -11,6 +11,7 @@ import time
 import gc
 import threading
 import logging
+import hashlib
 try:
     import psutil  # For memory monitoring
     PSUTIL_AVAILABLE = True
@@ -45,6 +46,141 @@ _last_inference_time = 0
 _inference_count = 0
 INFERENCE_DELAY = 0.15  # Slightly increased delay for stability
 MAX_BATCH_SIZE = 10    # Process in smaller batches
+
+# Wikimedia/network download protections
+WIKIMEDIA_DOWNLOAD_DELAY = 0.35
+WIKIMEDIA_MAX_RETRIES = 4
+WIKIMEDIA_BACKOFF_BASE_SECONDS = 1.0
+_last_download_time = 0.0
+_download_lock = threading.Lock()
+_download_cache_dir = os.path.join("storage", "cache", "thumbnails")
+
+
+def _build_image_request_headers() -> Dict[str, str]:
+    """Build a descriptive User-Agent for automated media downloads."""
+    return {
+        "User-Agent": (
+            "mpt-e/1.0 (semantic video thumbnail fetcher; "
+            "contact: noc@wikimedia.org-compatible client behavior)"
+        )
+    }
+
+
+def _get_cached_image_path(image_url: str) -> str:
+    """Map an image URL to a deterministic cache file path."""
+    digest = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+    return os.path.join(_download_cache_dir, f"{digest}.img")
+
+
+def _load_image_bytes_from_cache(image_url: str) -> Optional[bytes]:
+    """Load cached image bytes from disk if available."""
+    cache_path = _get_cached_image_path(image_url)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as cached_file:
+                return cached_file.read()
+        except Exception as cache_error:
+            logger.debug(f"Failed to read image cache {cache_path}: {cache_error}")
+    return None
+
+
+def _save_image_bytes_to_cache(image_url: str, image_data: bytes) -> None:
+    """Persist downloaded image bytes so repeated runs avoid re-downloading."""
+    try:
+        os.makedirs(_download_cache_dir, exist_ok=True)
+        cache_path = _get_cached_image_path(image_url)
+        with open(cache_path, "wb") as cached_file:
+            cached_file.write(image_data)
+    except Exception as cache_error:
+        logger.debug(f"Failed to write image cache for {image_url}: {cache_error}")
+
+
+def _rate_limited_get(image_url: str, timeout: tuple = (5, 10), stream: bool = False) -> requests.Response:
+    """Perform a GET request with baseline inter-request delay for Wikimedia friendliness."""
+    global _last_download_time
+    with _download_lock:
+        elapsed = time.time() - _last_download_time
+        if elapsed < WIKIMEDIA_DOWNLOAD_DELAY:
+            time.sleep(WIKIMEDIA_DOWNLOAD_DELAY - elapsed)
+        response = requests.get(
+            image_url,
+            timeout=timeout,
+            stream=stream,
+            headers=_build_image_request_headers(),
+            proxies=config.proxy,
+            verify=False,
+        )
+        _last_download_time = time.time()
+    return response
+
+
+def _download_image_bytes_with_retry(image_url: str, timeout: tuple = (5, 10), stream: bool = True) -> Optional[bytes]:
+    """Download image bytes with disk cache, rate limiting, and exponential backoff on 429."""
+    cached = _load_image_bytes_from_cache(image_url)
+    if cached:
+        return cached
+
+    last_error: Optional[Exception] = None
+    for attempt in range(WIKIMEDIA_MAX_RETRIES):
+        try:
+            response = _rate_limited_get(image_url, timeout=timeout, stream=stream)
+
+            if response.status_code == 429:
+                wait_time = WIKIMEDIA_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                logger.warning(
+                    f"429 Too Many Requests from {image_url} (attempt {attempt + 1}/{WIKIMEDIA_MAX_RETRIES}); "
+                    f"backing off for {wait_time:.1f}s"
+                )
+                time.sleep(wait_time)
+                continue
+
+            response.raise_for_status()
+
+            if stream:
+                image_data = b""
+                downloaded = 0
+                max_bytes = 10 * 1024 * 1024
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        logger.warning(f"Image download exceeded size limit, stopping at {downloaded} bytes: {image_url}")
+                        break
+                    image_data += chunk
+            else:
+                image_data = response.content
+
+            if not image_data:
+                logger.warning(f"Empty image response from: {image_url}")
+                return None
+
+            _save_image_bytes_to_cache(image_url, image_data)
+            return image_data
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            wait_time = WIKIMEDIA_BACKOFF_BASE_SECONDS * (2 ** attempt)
+            if attempt < WIKIMEDIA_MAX_RETRIES - 1:
+                logger.warning(f"Transient network error downloading {image_url}: {e}. Retrying in {wait_time:.1f}s")
+                time.sleep(wait_time)
+                continue
+            break
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            if attempt < WIKIMEDIA_MAX_RETRIES - 1 and e.response is not None and e.response.status_code >= 500:
+                wait_time = WIKIMEDIA_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                logger.warning(f"HTTP {e.response.status_code} downloading {image_url}. Retrying in {wait_time:.1f}s")
+                time.sleep(wait_time)
+                continue
+            break
+        except Exception as e:
+            last_error = e
+            break
+
+    if last_error:
+        logger.error(f"❌ Failed to download image from {image_url}: {last_error}")
+    return None
 
 def check_image_similarity_dependencies() -> bool:
     """Check if image similarity dependencies are available"""
@@ -267,38 +403,15 @@ def calculate_text_image_similarity(text: str, image_url: str, model_name: str =
         # Always download image if we don't have cached embeddings or if we need it for processing
         if image_embeds is None or not _caching_enabled or text_cache_key not in _text_embedding_cache:
             try:
-                # Use shorter timeout and add more robust error handling
-                response = requests.get(
-                    image_url, 
-                    timeout=(5, 10),  # 5s connect, 10s read timeout
+                image_data = _download_image_bytes_with_retry(
+                    image_url,
+                    timeout=(5, 10),
                     stream=True,
-                    headers={'User-Agent': 'Mozilla/5.0 (compatible; ImageBot/1.0)'}
                 )
-                response.raise_for_status()
-                
-                # Check content size to prevent memory issues
-                content_length = response.headers.get('content-length')
-                if content_length and int(content_length) > 10 * 1024 * 1024:  # 10MB limit
-                    safe_log("warning", f"Image too large ({content_length} bytes), skipping: {image_url}")
+                if not image_data:
+                    safe_log("warning", f"No image data received from: {image_url}")
                     return 0.0
-                
-                # Download with size limit
-                image_data = b""
-                downloaded = 0
-                max_size = 10 * 1024 * 1024  # 10MB limit
-                
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        downloaded += len(chunk)
-                        if downloaded > max_size:
-                            safe_log("warning", f"Image download exceeded size limit, stopping at {downloaded} bytes")
-                            break
-                        image_data += chunk
-                
-                if len(image_data) == 0:
-                    safe_log("warning", f"Empty image data received from: {image_url}")
-                    return 0.0
-                
+
                 image = Image.open(io.BytesIO(image_data)).convert('RGB')
                 
                 # Resize large images to prevent memory issues
@@ -474,22 +587,17 @@ def calculate_video_image_similarity(text: str, video_metadata: Dict, model_name
     return max_similarity
 
 def download_image(image_url: str) -> Optional[Image.Image]:
-    """Download and load image from URL"""
+    """Download and load image from URL with retry/backoff/rate limiting and disk cache."""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-        }
-        
-        response = requests.get(
-            image_url, 
-            headers=headers, 
-            proxies=config.proxy,
-            verify=False,
-            timeout=30
+        image_data = _download_image_bytes_with_retry(
+            image_url,
+            timeout=(10, 30),
+            stream=False,
         )
-        response.raise_for_status()
-        
-        image = Image.open(io.BytesIO(response.content))
+        if not image_data:
+            return None
+
+        image = Image.open(io.BytesIO(image_data))
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
@@ -697,4 +805,4 @@ def safe_log(level: str, message: str):
             log_level = getattr(logging, level.upper(), logging.INFO)
             logging.log(log_level, message)
         except:
-            print(f"[{level.upper()}] {message}") 
+            print(f"[{level.upper()}] {message}")
