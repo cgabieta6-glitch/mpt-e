@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import sys
 from datetime import datetime
 from typing import Union
 from xml.sax.saxutils import unescape
@@ -32,41 +31,17 @@ from moviepy.video.tools import subtitles  # type: ignore
 from app.config import config  # type: ignore
 from app.utils import utils  # type: ignore
 
-# Import Chatterbox TTS first; WhisperX is optional for word-level alignment
-ChatterboxTTS = None
+# Import Chatterbox TTS and WhisperX if available
 try:
     from chatterbox.tts import ChatterboxTTS  # type: ignore
-except Exception:
-    # Local repo fallback: chatterbox package sources live in chatterbox/src
-    local_chatterbox_src = os.path.join(utils.root_dir(), "chatterbox", "src")
-    if os.path.isdir(local_chatterbox_src) and local_chatterbox_src not in sys.path:
-        sys.path.insert(0, local_chatterbox_src)
-    if "chatterbox" in sys.modules:
-        del sys.modules["chatterbox"]
-    try:
-        from chatterbox.tts import ChatterboxTTS  # type: ignore
-    except Exception as e:
-        logger.warning(f"Chatterbox TTS import failed: {e}")
-
-try:
+    import whisperx  # type: ignore
     import torch  # type: ignore
     import torchaudio  # type: ignore
-    CHATTERBOX_AVAILABLE = ChatterboxTTS is not None
-    if CHATTERBOX_AVAILABLE:
-        logger.info("Chatterbox TTS is available")
-    else:
-        logger.warning("Chatterbox TTS is not importable in current environment")
+    CHATTERBOX_AVAILABLE = True
+    logger.info("Chatterbox TTS and WhisperX are available")
 except ImportError as e:
     CHATTERBOX_AVAILABLE = False
-    logger.warning(f"Chatterbox runtime dependencies not available: {e}")
-
-try:
-    import whisperx  # type: ignore
-    WHISPERX_AVAILABLE = True
-    logger.info("WhisperX is available for word-level alignment")
-except ImportError as e:
-    WHISPERX_AVAILABLE = False
-    logger.warning(f"WhisperX not available, will use sentence-level subtitle timing: {e}")
+    logger.warning(f"Chatterbox TTS or WhisperX not available: {e}")
 
 # Global Chatterbox model instance
 chatterbox_model = None
@@ -115,6 +90,9 @@ def get_chatterbox_voices() -> list[str]:
     Returns:
         声音列表，格式为 ["chatterbox:default:Default Voice", "chatterbox:clone:Voice Clone", ...]
     """
+    if not CHATTERBOX_AVAILABLE:
+        return []
+    
     voices = [
         "chatterbox:default:Default Voice-Neutral",
         "chatterbox:clone:Voice Clone-Custom"
@@ -1759,7 +1737,7 @@ def chatterbox_tts(
         SubMaker对象或None
     """
     if not CHATTERBOX_AVAILABLE:
-        logger.error("Chatterbox TTS is not available. Please install chatterbox-tts.")
+        logger.error("Chatterbox TTS is not available. Please install chatterbox-tts and whisperx.")
         return None
 
     text = text.strip()
@@ -1853,65 +1831,60 @@ def chatterbox_tts(
         temp_wav_file = voice_file.replace('.mp3', '_temp.wav')
         torchaudio.save(temp_wav_file, wav, 24000)
 
-        transcription_failed = False
-        result = {}
-        if WHISPERX_AVAILABLE:
-            # 3. 使用WhisperX获取精确的单词时间戳
-            logger.info("Generating word timestamps with WhisperX")
-
-            if whisperx_model is None:
-                logger.info("Loading WhisperX model...")
-                # Use appropriate compute type for CPU
-                compute_type = "int8" if device == "cpu" else "float16"
-                try:
+        # 3. 使用WhisperX获取精确的单词时间戳
+        logger.info("Generating word timestamps with WhisperX")
+        
+        if whisperx_model is None:
+            logger.info("Loading WhisperX model...")
+            # Use appropriate compute type for CPU
+            compute_type = "int8" if device == "cpu" else "float16"
+            try:
+                whisperx_model = whisperx.load_model("base", device, compute_type=compute_type)
+                logger.info(f"WhisperX model loaded successfully on {device} with {compute_type}")
+            except Exception as e:
+                logger.error(f"Failed to load WhisperX model on {device}: {e}")
+                if device == "cuda":
+                    logger.info("Falling back to CPU for WhisperX...")
+                    device = "cpu"
+                    compute_type = "int8"
                     whisperx_model = whisperx.load_model("base", device, compute_type=compute_type)
-                    logger.info(f"WhisperX model loaded successfully on {device} with {compute_type}")
-                except Exception as e:
-                    logger.error(f"Failed to load WhisperX model on {device}: {e}")
-                    if device == "cuda":
-                        logger.info("Falling back to CPU for WhisperX...")
-                        device = "cpu"
-                        compute_type = "int8"
-                        whisperx_model = whisperx.load_model("base", device, compute_type=compute_type)
-                        logger.info(f"WhisperX model loaded successfully on CPU with {compute_type}")
-                    else:
-                        raise
+                    logger.info(f"WhisperX model loaded successfully on CPU with {compute_type}")
+                else:
+                    raise
 
-            # 转录音频获取单词时间戳
-            audio = whisperx.load_audio(temp_wav_file)
-            result = whisperx_model.transcribe(audio, batch_size=16)
+        # 转录音频获取单词时间戳
+        audio = whisperx.load_audio(temp_wav_file)
+        result = whisperx_model.transcribe(audio, batch_size=16)
 
-            # Validate transcription result
-            if not result or "segments" not in result or not result["segments"]:
-                logger.warning("WhisperX transcription failed or returned empty result")
-                logger.debug(f"WhisperX result: {result}")
-                transcription_failed = True
-            else:
-                # Log transcribed text for validation
-                transcribed_text = " ".join([segment.get("text", "") for segment in result["segments"]]).strip()
-                logger.info(f"WhisperX transcribed: '{transcribed_text[:100]}...' (length: {len(transcribed_text)} chars)")  # type: ignore
-
-                # Check if transcription matches input text reasonably well
-                text_similarity = len(set(text.lower().split()) & set(transcribed_text.lower().split())) / max(len(text.split()), 1)
-                logger.debug(f"Text similarity score: {text_similarity:.2f}")
-
-                if text_similarity < 0.3:
-                    logger.warning(f"Transcription seems inaccurate (similarity: {text_similarity:.2f})")
-                    if text_similarity < 0.1:
-                        logger.error(f"Transcription quality too poor (similarity: {text_similarity:.2f}), falling back to sentence-level timing")
-                        transcription_failed = True
-
-            # 加载对齐模型 (only if transcription is good)
-            if not transcription_failed:
-                try:
-                    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-                    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
-                except Exception as e:
-                    logger.error(f"WhisperX alignment failed: {e}")
-                    transcription_failed = True
-        else:
-            logger.warning("WhisperX is not installed; using sentence-level subtitle timing for Chatterbox TTS")
+        # Validate transcription result
+        transcription_failed = False
+        if not result or "segments" not in result or not result["segments"]:
+            logger.warning("WhisperX transcription failed or returned empty result")
+            logger.debug(f"WhisperX result: {result}")
             transcription_failed = True
+        else:
+            # Log transcribed text for validation
+            transcribed_text = " ".join([segment.get("text", "") for segment in result["segments"]]).strip()
+            logger.info(f"WhisperX transcribed: '{transcribed_text[:100]}...' (length: {len(transcribed_text)} chars)")  # type: ignore
+            
+            # Check if transcription matches input text reasonably well
+            text_similarity = len(set(text.lower().split()) & set(transcribed_text.lower().split())) / max(len(text.split()), 1)
+            logger.debug(f"Text similarity score: {text_similarity:.2f}")
+            
+            if text_similarity < 0.3:
+                logger.warning(f"Transcription seems inaccurate (similarity: {text_similarity:.2f})")
+                if text_similarity < 0.1:
+                    logger.error(f"Transcription quality too poor (similarity: {text_similarity:.2f}), falling back to sentence-level timing")
+                    transcription_failed = True
+
+        # 加载对齐模型 (only if transcription is good)
+        if not transcription_failed:
+            try:
+                model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
+                result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
+            except Exception as e:
+                logger.error(f"WhisperX alignment failed: {e}")
+                transcription_failed = True
 
         # 4. 创建SubMaker并填充时间戳
         sub_maker = ensure_submaker_compatibility(SubMaker())
