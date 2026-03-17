@@ -43,8 +43,8 @@ if [ ! -d "chatterbox" ]; then
     cd ..
 fi
 
-# WhisperX for word-level timestamps
-pip install whisperx==3.4.2
+# WhisperX is optional and disabled by default (set CHATTERBOX_ENABLE_WHISPERX=1 to enable)
+# pip install whisperx==3.4.2
 
 echo "✅ CUDA installation complete!"
 echo ""
@@ -68,6 +68,6 @@ echo "✅ PyTorch 2.5.1 with CUDA 12.1 support"
 echo "✅ 13 NVIDIA CUDA libraries"
 echo "✅ cuDNN 9.x (primary) + cuDNN 8.x (compatibility)"
 echo "✅ Chatterbox TTS with voice cloning"
-echo "✅ WhisperX for word-level timestamps"
+echo "ℹ️ WhisperX is optional (disabled by default)"
 echo ""
 echo "🚀 Ready to run: ./webui.sh" 
