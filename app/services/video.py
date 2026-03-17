@@ -7,6 +7,7 @@ import random
 import gc
 import shutil
 import json
+import subprocess
 from typing import List
 from loguru import logger
 import numpy as np
@@ -84,9 +85,38 @@ def _cuda_video_enabled() -> bool:
     return _is_truthy(os.environ.get("VIDEO_USE_CUDA", "0"))
 
 
+# Cache for NVENC availability
+_nvenc_available = None
+
+def _is_nvenc_available() -> bool:
+    """Check if the current FFMPEG binary supports h264_nvenc."""
+    global _nvenc_available
+    if _nvenc_available is not None:
+        return _nvenc_available
+
+    try:
+        ffmpeg_exe = "ffmpeg"
+        try:
+            from moviepy.config import get_setting
+            ffmpeg_exe = get_setting("FFMPEG_BINARY")
+        except ImportError:
+            try:
+                import imageio_ffmpeg
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            except ImportError:
+                pass
+                
+        result = subprocess.run([ffmpeg_exe, "-encoders"], capture_output=True, text=True)
+        _nvenc_available = "h264_nvenc" in result.stdout
+    except Exception:
+        _nvenc_available = False
+
+    return _nvenc_available
+
+
 def _write_videofile_with_fallback(clip, output_path: str, **kwargs):
     """Write video using optional NVENC, with automatic CPU fallback."""
-    use_cuda = True  # Prefer NVENC by default on capable GPUs
+    use_cuda = _is_nvenc_available() and _cuda_video_enabled() if "VIDEO_USE_CUDA" in os.environ else _is_nvenc_available()
     requested_codec = kwargs.pop("codec", video_codec)
     ffmpeg_params = kwargs.pop("ffmpeg_params", quality_params)
 
