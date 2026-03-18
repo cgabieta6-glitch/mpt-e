@@ -155,6 +155,14 @@ endpoint = ""
 # material_directory = "/user/harry/videos"  #表示将视频素材下载到指定的文件夹中
 material_directory = ""
 
+# Ken Burns effect settings (for Wikimedia image-to-video conversion)
+# When Wikimedia returns still images instead of videos, they are converted to
+# smooth panning/zooming video clips using the Ken Burns effect.
+# Zoom factor: 1.10 = subtle, 1.25 = normal (default), 1.50 = dramatic
+ken_burns_zoom_factor = 1.25
+# Speed: "slow" (1.4x duration), "normal" (1x), "fast" (0.7x duration)
+ken_burns_speed = "normal"
+
 # Enable verbose logging for debugging
 # When set to true, detailed progress logs will be shown for every video processing step
 # When set to false, only summary logs will be shown (every 10 segments)
