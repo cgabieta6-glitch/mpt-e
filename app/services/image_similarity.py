@@ -607,6 +607,75 @@ def download_image(image_url: str) -> Optional[Image.Image]:
         logger.warning(f"Failed to download image from {image_url}: {e}")
         return None
 
+
+def score_ken_burns_suitability(
+    image_url: str,
+    target_width: int = 1080,
+    target_height: int = 1920,
+) -> float:
+    """Score how suitable an image is for a Ken Burns effect (0.0 to 1.0).
+    
+    Higher scores indicate images that will produce better Ken Burns clips:
+    - High resolution relative to target canvas → more room to pan/zoom without blur
+    - Non-square aspect ratios → more panning travel distance
+    - Photographic content (wide-angle landscapes, cityscapes) → more visual interest
+    
+    This score can be used as a bonus multiplier on CLIP similarity when choosing
+    between Wikimedia bitmap candidates.
+    
+    Args:
+        image_url: URL (or local path) of the image to evaluate.
+        target_width: Canvas width the Ken Burns clip will render to.
+        target_height: Canvas height the Ken Burns clip will render to.
+        
+    Returns:
+        Float between 0.0 and 1.0 (0 = poor candidate, 1 = excellent candidate).
+    """
+    try:
+        image = download_image(image_url)
+        if image is None:
+            return 0.0
+        
+        img_w, img_h = image.size
+        
+        # ── Resolution score (0.0 – 0.6) ──
+        # How much bigger the image is than the target canvas
+        resolution_ratio = min(img_w / max(target_width, 1), img_h / max(target_height, 1))
+        if resolution_ratio >= 1.5:
+            res_score = 0.6  # Excellent: plenty of room to pan
+        elif resolution_ratio >= 1.0:
+            res_score = 0.4  # Good: covers canvas
+        elif resolution_ratio >= 0.6:
+            res_score = 0.2  # Marginal: will need upscaling
+        else:
+            res_score = 0.05  # Poor: heavy upscaling, will look blurry
+        
+        # ── Aspect diversity score (0.0 – 0.4) ──
+        # Non-square images allow more panning travel
+        img_ratio = img_w / max(img_h, 1)
+        canvas_ratio = target_width / max(target_height, 1)
+        ratio_diff = abs(img_ratio - canvas_ratio) / max(canvas_ratio, 0.01)
+        
+        if ratio_diff > 0.5:
+            aspect_score = 0.4  # Very different aspect → lots of pan travel
+        elif ratio_diff > 0.2:
+            aspect_score = 0.3  # Moderate difference
+        elif ratio_diff > 0.05:
+            aspect_score = 0.2  # Slight difference
+        else:
+            aspect_score = 0.1  # Nearly matching → zoom-only effects
+        
+        total = min(1.0, res_score + aspect_score)
+        
+        # Clean up
+        del image
+        
+        return total
+        
+    except Exception as e:
+        logger.debug(f"Ken Burns suitability scoring failed for {image_url}: {e}")
+        return 0.0
+
 def select_representative_images(image_urls: List[str], max_images: int = 1) -> List[str]:
     """Select the most representative images from a list"""
     if not image_urls:
