@@ -128,6 +128,10 @@ class VideoParams(BaseModel):
     image_similarity_threshold: Optional[float] = 0.7
     image_similarity_model: Optional[str] = "clip-vit-base-patch32"
     
+    # Ken Burns effect settings (for Wikimedia image-to-video conversion)
+    ken_burns_zoom_factor: Optional[float] = 1.25  # 1.10=subtle, 1.25=normal, 1.50=dramatic
+    ken_burns_speed: Optional[str] = "normal"  # "slow", "normal", "fast"
+    
     n_threads: Optional[int] = 2
     paragraph_number: Optional[int] = 1
 
