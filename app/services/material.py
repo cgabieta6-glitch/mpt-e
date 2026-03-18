@@ -172,7 +172,7 @@ def search_wikimedia_materials(
             "action": "query",
             "format": "json",
             "generator": "search",
-            "gsrsearch": f"filetype:{filetype} {search_term}",
+            "gsrsearch": f'"{search_term}" filetype:{filetype}',
             "gsrnamespace": 6,  # 6 is File namespace
             "gsrlimit": 50,
             "prop": "imageinfo",
@@ -220,22 +220,40 @@ def search_wikimedia_materials(
                 size = info.get("size", 0)
                 url = info.get("url", "")
                 
-                # Check for high resolution
-                if width < 1080 and height < 1080:
+                # Check for resolution (relaxed to 480p)
+                if width < 480 and height < 480:
                     continue
                     
-                # Check for file size limit (> 100MB = 104857600 bytes)
-                if size > 104857600:
+                # Check for file size limit (> 500MB = 524288000 bytes)
+                if size > 524288000:
                     logger.warning(f"skipping wikimedia material {url} due to large size: {size} bytes")
                     continue
                     
                 if not url:
                     continue
 
+                # Extract true duration if it's a video
+                real_duration = minimum_duration
+                if not is_image:
+                    ext_meta = info.get("extmetadata", {})
+                    if "length" in ext_meta:
+                        try:
+                            # length is usually a string representing seconds
+                            real_duration = float(ext_meta.get("length", {}).get("value", 0))
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Ensure the video meets the actual minimum duration requirement
+                    if real_duration < minimum_duration:
+                        continue
+                    # Reject excessively long videos to prevent massive downloads (e.g., > 15 mins)
+                    if real_duration > 900:
+                        continue
+
                 item = MaterialInfo()
                 item.provider = "wikimedia"
                 item.url = url
-                item.duration = minimum_duration
+                item.duration = real_duration
                 item.is_image = is_image
                 item.thumbnail_url = info.get("thumburl", "") or ""
                 
@@ -266,40 +284,68 @@ def save_video(video_url: str, save_dir: str = "", search_term: str = "", thumbn
     url_without_query = video_url.split("?")[0]
     url_hash = utils.md5(url_without_query)
     video_id = f"vid-{url_hash}"
-    video_path = f"{save_dir}/{video_id}.mp4"
+    
+    # Detect the correct native extension from the URL
+    ext = os.path.splitext(url_without_query)[-1].lower()
+    if not ext or ext not in ['.mp4', '.webm', '.ogv', '.ogg', '.mov']:
+        ext = '.mp4'  # Fallback
+        
+    native_video_path = f"{save_dir}/{video_id}{ext}"
+    final_mp4_path = f"{save_dir}/{video_id}.mp4"
 
     # if video already exists, return the path
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-        logger.info(f"video already exists: {video_path}")
+    if os.path.exists(final_mp4_path) and os.path.getsize(final_mp4_path) > 0:
+        logger.info(f"video already exists: {final_mp4_path}")
         # Save metadata if search_term is provided and metadata doesn't exist
-        if search_term and not semantic_video.load_video_metadata(video_path):
+        if search_term and not semantic_video.load_video_metadata(final_mp4_path):
             additional_info: dict[str, Any] = {}
             if thumbnail_url:
                 additional_info["thumbnail_url"] = thumbnail_url
             if preview_images:
                 additional_info["preview_images"] = preview_images
-            semantic_video.save_video_metadata(video_path, search_term, additional_info)
-        return video_path
+            semantic_video.save_video_metadata(final_mp4_path, search_term, additional_info)
+        return final_mp4_path
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
 
-    # if video does not exist, download it
-    with open(video_path, "wb") as f:
-        f.write(
-            requests.get(
-                video_url,
-                headers=headers,
-                proxies=config.proxy,
-                verify=False,
-                timeout=(60, 240),
-            ).content
-        )
+    # Stream download chunk by chunk (Zero OOM)
+    with requests.get(video_url, headers=headers, proxies=config.proxy, verify=False, stream=True, timeout=(60, 240)) as r:
+        r.raise_for_status()
+        with open(native_video_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+    if os.path.exists(native_video_path) and os.path.getsize(native_video_path) > 0:
         try:
-            clip = VideoFileClip(video_path)
+            # If native isn't mp4, transcode via FFmpeg to prevent downstream moviepy/opencv bugs
+            if ext != '.mp4':
+                import subprocess
+                logger.info(f"transcoding {ext} to mp4: {native_video_path}")
+                
+                ffmpeg_exe = "ffmpeg"
+                try:
+                    from moviepy.config import get_setting
+                    ffmpeg_exe = get_setting("FFMPEG_BINARY")
+                except ImportError:
+                    pass
+                    
+                cmd = [
+                    ffmpeg_exe, "-i", native_video_path, 
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-y", final_mp4_path
+                ]
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    os.remove(native_video_path) # Cleanup
+                except:
+                    pass
+            else:
+                final_mp4_path = native_video_path
+                
+            clip = VideoFileClip(final_mp4_path)
             duration = clip.duration
             fps = clip.fps
             clip.close()
@@ -316,14 +362,18 @@ def save_video(video_url: str, save_dir: str = "", search_term: str = "", thumbn
                         additional_info["thumbnail_url"] = thumbnail_url
                     if preview_images:
                         additional_info["preview_images"] = preview_images
-                    semantic_video.save_video_metadata(video_path, search_term, additional_info)
-                return video_path
+                    semantic_video.save_video_metadata(final_mp4_path, search_term, additional_info)
+                return final_mp4_path
         except Exception as e:
             try:
-                os.remove(video_path)
+                os.remove(final_mp4_path)
             except Exception:
                 pass
-            logger.warning(f"invalid video file: {video_path} => {str(e)}")
+            try:
+                os.remove(native_video_path)
+            except Exception:
+                pass
+            logger.warning(f"invalid video file: {final_mp4_path} => {str(e)}")
     return ""
 
 
