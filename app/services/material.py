@@ -377,7 +377,143 @@ def save_video(video_url: str, save_dir: str = "", search_term: str = "", thumbn
     return ""
 
 
-def save_image_as_video(image_url: str, save_dir: str = "", search_term: str = "", target_duration: int = 5, video_aspect: VideoAspect = VideoAspect.portrait) -> str:
+def _smoothstep(t: float) -> float:
+    """Hermite smoothstep interpolation: smooth ease-in/ease-out for cinematic motion."""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _pick_ken_burns_preset(img_w: int, img_h: int, canvas_w: int, canvas_h: int) -> str:
+    """Choose a Ken Burns motion preset based on image vs canvas aspect ratio with randomness."""
+    img_ratio = img_w / max(img_h, 1)
+    canvas_ratio = canvas_w / max(canvas_h, 1)
+    
+    # Aspect-ratio-aware presets weighted by suitability
+    if img_ratio > canvas_ratio * 1.15:
+        # Image is wider than canvas → horizontal pans work best
+        presets = ["pan_left", "pan_right", "pan_left", "pan_right", "zoom_in", "zoom_out", "diagonal", "parallax"]
+    elif img_ratio < canvas_ratio * 0.85:
+        # Image is taller than canvas → vertical pans work best
+        presets = ["pan_up", "pan_down", "pan_up", "pan_down", "zoom_in", "zoom_out", "diagonal", "parallax"]
+    else:
+        # Square-ish → zoom effects look best
+        presets = ["zoom_in", "zoom_out", "zoom_in", "zoom_out", "pan_left", "pan_right", "diagonal", "parallax"]
+    
+    return random.choice(presets)
+
+
+def _create_ken_burns_position_fn(
+    preset: str,
+    img_w: int, img_h: int,
+    canvas_w: int, canvas_h: int,
+    duration: float,
+    zoom_factor: float = 1.25,
+):
+    """Create a position function for the given Ken Burns preset.
+    
+    Returns a callable (t) -> (x, y) for use with MoviePy .with_position().
+    All motion uses smoothstep easing for cinematic feel.
+    """
+    x_overflow = img_w - canvas_w
+    y_overflow = img_h - canvas_h
+    
+    # Ensure non-negative overflow (image should always be >= canvas after scaling)
+    x_overflow = max(0, x_overflow)
+    y_overflow = max(0, y_overflow)
+    
+    # Center offsets
+    cx = -x_overflow / 2.0
+    cy = -y_overflow / 2.0
+
+    def _pos(t):
+        progress = _smoothstep(max(0.0, min(1.0, t / duration)))
+        
+        if preset == "pan_left":
+            # Pan from right edge to left edge
+            x = -(x_overflow * (1.0 - progress))
+            y = cy  # vertically centered
+        elif preset == "pan_right":
+            # Pan from left edge to right edge
+            x = -(x_overflow * progress)
+            y = cy
+        elif preset == "pan_up":
+            # Pan from bottom to top
+            x = cx
+            y = -(y_overflow * (1.0 - progress))
+        elif preset == "pan_down":
+            # Pan from top to bottom
+            x = cx
+            y = -(y_overflow * progress)
+        elif preset == "diagonal":
+            # Random diagonal direction picked per clip
+            dx = random.choice([-1, 1])
+            dy = random.choice([-1, 1])
+            start_x = 0 if dx > 0 else -x_overflow
+            start_y = 0 if dy > 0 else -y_overflow
+            end_x = -x_overflow if dx > 0 else 0
+            end_y = -y_overflow if dy > 0 else 0
+            x = start_x + (end_x - start_x) * progress
+            y = start_y + (end_y - start_y) * progress
+        elif preset == "parallax":
+            # Gentle S-curve horizontal drift with slight vertical sway
+            import math as _math
+            x = cx + (x_overflow * 0.4) * _math.sin(progress * _math.pi)
+            y = cy + (y_overflow * 0.15) * _math.cos(progress * _math.pi * 0.5)
+        elif preset == "zoom_out":
+            # Start zoomed-in on center, pull back (simulated by starting tight, ending centered)
+            zoom_progress = 1.0 - progress  # reverse
+            tightness = 0.3 + 0.7 * (1.0 - zoom_progress)
+            x = -(x_overflow * (0.5 - tightness * 0.5 + tightness * 0.5))
+            y = -(y_overflow * (0.5 - tightness * 0.5 + tightness * 0.5))
+            # Drift slightly during zoom for more natural feel
+            x += (x_overflow * 0.15) * (1.0 - progress)
+            y += (y_overflow * 0.1) * progress
+        else:
+            # zoom_in (default) — drift toward center while feeling like camera pushes in
+            x = -(x_overflow * 0.1) - (x_overflow * 0.3) * progress
+            y = -(y_overflow * 0.1) - (y_overflow * 0.3) * progress
+        
+        return (x, y)
+    
+    # Pre-resolve the random diagonal direction so it's consistent across frames
+    if preset == "diagonal":
+        dx = random.choice([-1, 1])
+        dy = random.choice([-1, 1])
+        start_x = 0 if dx > 0 else -x_overflow
+        start_y = 0 if dy > 0 else -y_overflow
+        end_x = -x_overflow if dx > 0 else 0
+        end_y = -y_overflow if dy > 0 else 0
+        
+        def _diagonal_pos(t):
+            progress = _smoothstep(max(0.0, min(1.0, t / duration)))
+            x = start_x + (end_x - start_x) * progress
+            y = start_y + (end_y - start_y) * progress
+            return (x, y)
+        return _diagonal_pos
+    
+    return _pos
+
+
+def save_image_as_video(
+    image_url: str,
+    save_dir: str = "",
+    search_term: str = "",
+    target_duration: int = 5,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    ken_burns_zoom_factor: float = 0.0,
+    ken_burns_speed: str = "",
+) -> str:
+    """Convert a static image to a video clip with cinematic Ken Burns effect.
+    
+    Args:
+        image_url: URL of the image to download and convert.
+        save_dir: Directory to save the output video. Defaults to cache_videos.
+        search_term: Search term for metadata tagging.
+        target_duration: Base duration in seconds for the output clip.
+        video_aspect: Target aspect ratio.
+        ken_burns_zoom_factor: Overscale factor (1.15-1.50). 0 = use config/default.
+        ken_burns_speed: Speed preset ("slow", "normal", "fast"). Empty = use config/default.
+    """
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
 
@@ -393,7 +529,7 @@ def save_image_as_video(image_url: str, save_dir: str = "", search_term: str = "
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
         logger.info(f"video already exists: {video_path}")
         if search_term and not semantic_video.load_video_metadata(video_path):
-            additional_info = {"thumbnail_url": image_url} # type: dict[str, Any]
+            additional_info = {"thumbnail_url": image_url}  # type: dict[str, Any]
             semantic_video.save_video_metadata(video_path, search_term, additional_info)
         return video_path
 
@@ -401,84 +537,108 @@ def save_image_as_video(image_url: str, save_dir: str = "", search_term: str = "
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
 
-    # Download image
+    # ── Streaming download (avoids OOM on large Wikimedia images) ──
     if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
-        with open(image_path, "wb") as f:
-            f.write(
-                requests.get(
-                    image_url,
-                    headers=headers,
-                    proxies=config.proxy,
-                    verify=False,
-                    timeout=(60, 240),
-                ).content
-            )
+        try:
+            with requests.get(
+                image_url,
+                headers=headers,
+                proxies=config.proxy,
+                verify=False,
+                timeout=(60, 240),
+                stream=True,
+            ) as r:
+                r.raise_for_status()
+                with open(image_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+        except Exception as dl_err:
+            logger.error(f"failed to download image {image_url}: {dl_err}")
+            return ""
 
     if os.path.exists(image_path) and os.path.getsize(image_path) > 0:
         try:
-            from app.services.video import video_codec, video_bitrate, audio_bitrate, quality_params, fps  # type: ignore
-            
+            from app.services.video import (  # type: ignore
+                video_bitrate, quality_params, fps,
+                _write_videofile_with_fallback,
+            )
+
             aspect = VideoAspect(video_aspect)
             req_width, req_height = aspect.to_resolution()
 
+            # ── Resolve Ken Burns parameters from config / defaults ──
+            zoom = ken_burns_zoom_factor
+            if zoom <= 0:
+                zoom = float(config.app.get("ken_burns_zoom_factor", 1.25))
+            zoom = max(1.10, min(1.50, zoom))  # clamp to sane range
+
+            speed = ken_burns_speed or config.app.get("ken_burns_speed", "normal")
+            speed_multipliers = {"slow": 1.4, "normal": 1.0, "fast": 0.7}
+            duration_mult = speed_multipliers.get(speed, 1.0)
+            effective_duration = max(2, int(target_duration * duration_mult))
+
             img_clip = ImageClip(image_path)
-            
-            # Resizing Guard (4K max)
+
+            # ── Resizing Guard: cap at 4K to conserve memory ──
             if img_clip.w > 3840 or img_clip.h > 2160:
                 logger.info(f"downscaling extremely large image {img_clip.size} to conserve memory: {image_path}")
-                scale = min(1920 / img_clip.w, 1080 / img_clip.h)
+                scale = min(3840 / img_clip.w, 2160 / img_clip.h)
                 new_w, new_h = int(img_clip.w * scale), int(img_clip.h * scale)
                 img_clip = img_clip.resized(new_size=(new_w, new_h))
-            
-            # Apply Ken Burns effect
-            # Scale the image slightly larger than the target resolution
-            scale_factor = max(req_width / img_clip.w, req_height / img_clip.h) * 1.2
+
+            # ── Low-res quality guard ──
+            min_dim = min(img_clip.w, img_clip.h)
+            target_min_dim = min(req_width, req_height)
+            if min_dim < target_min_dim * 0.4:
+                logger.warning(
+                    f"image too small for quality Ken Burns ({img_clip.w}x{img_clip.h} vs "
+                    f"target {req_width}x{req_height}). Proceeding with gentle zoom only."
+                )
+                zoom = min(zoom, 1.15)  # reduce zoom to hide upscale artifacts
+
+            # ── Scale image to oversize the canvas by zoom factor ──
+            scale_factor = max(req_width / img_clip.w, req_height / img_clip.h) * zoom
             new_width = int(img_clip.w * scale_factor)
             new_height = int(img_clip.h * scale_factor)
             img_clip = img_clip.resized(new_size=(new_width, new_height))
-            
-            # Smoothly pan over the duration
-            def get_position(t):
-                # Calculate progress from 0 to 1
-                progress = max(0.0, min(1.0, t / target_duration))
-                
-                # Pan from (left, top) to (right, bottom) of the overflowing region
-                # When image is larger than canvas, position can be negative text indicating the top-left corner of the image relative to canvas
-                x_overflow = img_clip.w - req_width
-                y_overflow = img_clip.h - req_height
-                
-                x = - (x_overflow * progress)
-                y = - (y_overflow * progress)
-                return (x, y)
-                
-            img_clip = img_clip.with_position(get_position)
-            
-            # Create a background to composite on
-            bg_clip = ColorClip(size=(req_width, req_height), color=(0, 0, 0)).with_duration(target_duration)
-            final_clip = CompositeVideoClip([bg_clip, img_clip.with_duration(target_duration)])
-            
-            final_clip.write_videofile(
-                video_path, 
-                fps=fps, 
-                codec=video_codec, 
+
+            # ── Pick motion preset and create position function ──
+            preset = _pick_ken_burns_preset(new_width, new_height, req_width, req_height)
+            logger.info(f"Ken Burns preset: {preset}, zoom: {zoom:.2f}, duration: {effective_duration}s")
+
+            position_fn = _create_ken_burns_position_fn(
+                preset=preset,
+                img_w=new_width, img_h=new_height,
+                canvas_w=req_width, canvas_h=req_height,
+                duration=effective_duration,
+                zoom_factor=zoom,
+            )
+
+            img_clip = img_clip.with_position(position_fn).with_duration(effective_duration)
+
+            # ── Composite onto black background ──
+            bg_clip = ColorClip(size=(req_width, req_height), color=(0, 0, 0)).with_duration(effective_duration)
+            final_clip = CompositeVideoClip([bg_clip, img_clip])
+
+            # ── Write via NVENC-aware fallback ──
+            _write_videofile_with_fallback(
+                final_clip,
+                video_path,
+                fps=fps,
                 logger=None,
                 bitrate=video_bitrate,
-                ffmpeg_params=quality_params
+                ffmpeg_params=quality_params,
             )
-            
+
+            # ── Cleanup (close composite which recursively closes children) ──
             final_clip.close()
-            img_clip.close()
-            bg_clip.close()
-            
-            del final_clip
-            del img_clip
-            del bg_clip
+            del final_clip, img_clip, bg_clip
             import gc
             gc.collect()
-            
+
             if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
                 if search_term:
-                    additional_info = {"thumbnail_url": image_url} # type: dict[str, Any]
+                    additional_info = {"thumbnail_url": image_url}  # type: dict[str, Any]
                     semantic_video.save_video_metadata(video_path, search_term, additional_info)
                 return video_path
         except Exception as e:
@@ -487,7 +647,7 @@ def save_image_as_video(image_url: str, save_dir: str = "", search_term: str = "
             except Exception:
                 pass
             logger.warning(f"invalid image or conversion failed: {image_url} => {str(e)}")
-            
+
     return ""
 
 
