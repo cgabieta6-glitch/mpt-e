@@ -296,30 +296,52 @@ def save_video(video_url: str, save_dir: str = "", search_term: str = "", thumbn
     # if video already exists, return the path
     if os.path.exists(final_mp4_path) and os.path.getsize(final_mp4_path) > 0:
         logger.info(f"video already exists: {final_mp4_path}")
-        # Save metadata if search_term is provided and metadata doesn't exist
+        # Save metadata — wrapped in try/except to survive Streamlit thread context issues
         if search_term and not semantic_video.load_video_metadata(final_mp4_path):
-            additional_info: dict[str, Any] = {}
-            if thumbnail_url:
-                additional_info["thumbnail_url"] = thumbnail_url
-            if preview_images:
-                additional_info["preview_images"] = preview_images
-            semantic_video.save_video_metadata(final_mp4_path, search_term, additional_info)
+            try:
+                additional_info: dict[str, Any] = {}
+                if thumbnail_url:
+                    additional_info["thumbnail_url"] = thumbnail_url
+                if preview_images:
+                    additional_info["preview_images"] = preview_images
+                semantic_video.save_video_metadata(final_mp4_path, search_term, additional_info)
+            except Exception as meta_err:
+                # Swallow Streamlit NoSessionContext and similar thread errors
+                logger.debug(f"metadata save skipped (will retry on main thread): {meta_err}")
         return final_mp4_path
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
 
-    # Stream download chunk by chunk (Zero OOM)
-    with requests.get(video_url, headers=headers, proxies=config.proxy, verify=False, stream=True, timeout=(60, 240)) as r:
-        r.raise_for_status()
-        with open(native_video_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
+    # ── Streaming download (Wikimedia files can be 100MB+, need generous timeouts) ──
+    # connect=120s, read=600s — large .webm/.ogv may stream slowly from Wikimedia CDN
+    download_timeout = (
+        int(config.app.get("download_connect_timeout", 120)),
+        int(config.app.get("download_read_timeout", 600)),
+    )
+    logger.info(f"downloading {ext} file: {video_url} (timeout: {download_timeout})")
+
+    try:
+        with requests.get(video_url, headers=headers, proxies=config.proxy, verify=False,
+                          stream=True, timeout=download_timeout) as r:
+            r.raise_for_status()
+            downloaded_bytes = 0
+            with open(native_video_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):  # 64KB chunks for speed
+                    f.write(chunk)
+                    downloaded_bytes += len(chunk)
+            logger.info(f"download complete: {downloaded_bytes / 1024 / 1024:.1f} MB → {native_video_path}")
+    except requests.exceptions.Timeout:
+        logger.error(f"download timed out after {download_timeout}s: {video_url}")
+        return ""
+    except requests.exceptions.RequestException as dl_err:
+        logger.error(f"download failed: {video_url} → {dl_err}")
+        return ""
 
     if os.path.exists(native_video_path) and os.path.getsize(native_video_path) > 0:
         try:
-            # If native isn't mp4, transcode via FFmpeg to prevent downstream moviepy/opencv bugs
+            # ── Transcode non-mp4 formats via FFmpeg with subprocess timeout ──
             if ext != '.mp4':
                 import subprocess
                 logger.info(f"transcoding {ext} to mp4: {native_video_path}")
@@ -330,21 +352,37 @@ def save_video(video_url: str, save_dir: str = "", search_term: str = "", thumbn
                     ffmpeg_exe = get_setting("FFMPEG_BINARY")
                 except ImportError:
                     pass
-                    
+
+                # FFmpeg timeout = 180s — even large .ogv/.webm should finish within this
+                ffmpeg_timeout = int(config.app.get("ffmpeg_transcode_timeout", 180))
                 cmd = [
                     ffmpeg_exe, "-i", native_video_path, 
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                     "-c:a", "aac", "-b:a", "128k",
                     "-y", final_mp4_path
                 ]
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 try:
-                    os.remove(native_video_path) # Cleanup
-                except:
+                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=ffmpeg_timeout)
+                    logger.info(f"transcode complete: {final_mp4_path}")
+                except subprocess.TimeoutExpired:
+                    logger.error(f"FFmpeg transcode timed out after {ffmpeg_timeout}s: {native_video_path}")
+                    _cleanup_files([native_video_path, final_mp4_path])
+                    return ""
+                except subprocess.CalledProcessError as ffmpeg_err:
+                    logger.error(f"FFmpeg transcode failed (exit {ffmpeg_err.returncode}): {native_video_path}")
+                    _cleanup_files([native_video_path, final_mp4_path])
+                    return ""
+
+                # Cleanup native file after successful transcode
+                try:
+                    os.remove(native_video_path)
+                except Exception:
                     pass
             else:
                 final_mp4_path = native_video_path
                 
+            # ── Validate the transcoded/downloaded MP4 ──
             clip = VideoFileClip(final_mp4_path)
             duration = clip.duration
             fps = clip.fps
@@ -355,26 +393,34 @@ def save_video(video_url: str, save_dir: str = "", search_term: str = "", thumbn
             gc.collect()
             
             if duration > 0 and fps > 0:
-                # Save metadata with search term and image data
+                # Save metadata — wrapped to survive thread context issues
                 if search_term:
-                    additional_info = {} # type: dict[str, Any]
-                    if thumbnail_url:
-                        additional_info["thumbnail_url"] = thumbnail_url
-                    if preview_images:
-                        additional_info["preview_images"] = preview_images
-                    semantic_video.save_video_metadata(final_mp4_path, search_term, additional_info)
+                    try:
+                        additional_info = {}  # type: dict[str, Any]
+                        if thumbnail_url:
+                            additional_info["thumbnail_url"] = thumbnail_url
+                        if preview_images:
+                            additional_info["preview_images"] = preview_images
+                        semantic_video.save_video_metadata(final_mp4_path, search_term, additional_info)
+                    except Exception as meta_err:
+                        logger.debug(f"metadata save deferred (thread context): {meta_err}")
                 return final_mp4_path
+            else:
+                logger.warning(f"invalid video (duration={duration}, fps={fps}): {final_mp4_path}")
         except Exception as e:
-            try:
-                os.remove(final_mp4_path)
-            except Exception:
-                pass
-            try:
-                os.remove(native_video_path)
-            except Exception:
-                pass
+            _cleanup_files([final_mp4_path, native_video_path])
             logger.warning(f"invalid video file: {final_mp4_path} => {str(e)}")
     return ""
+
+
+def _cleanup_files(paths: List[str]) -> None:
+    """Silently remove a list of file paths (best-effort)."""
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
 
 
 def _smoothstep(t: float) -> float:
@@ -776,16 +822,23 @@ def download_videos(
         percentage = (count / len(valid_video_items)) * 100 if valid_video_items else 0
         logger.info(f"   📹 '{term}': {count} videos ({percentage:.1f}%)")
 
+    # ── Thread-safe download loop with retries and configurable timeouts ──
+    # Timeout defaults to 300s to handle slow Wikimedia transcoding/downloads
+    task_timeout = int(config.app.get("download_task_timeout", 300))
+    max_retries = int(config.app.get("download_max_retries", 2))
+    
+    # Store metadata to be saved on the main thread at the end (to avoid Streamlit thread crashes)
+    deferred_metadata = []
     video_paths = []
+    downloaded_urls = set()
+    total_duration = 0.0
+
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
         material_directory = utils.task_dir(task_id)
     elif material_directory and not os.path.isdir(material_directory):
         material_directory = ""
 
-    total_duration = 0.0
-    downloaded_urls = set()  # Track downloaded URLs to prevent runtime duplicates
-    
     import threading
     class WorkerThread(threading.Thread):
         def __init__(self, func, *args, **kwargs):
@@ -810,49 +863,76 @@ def download_videos(
             item_thumbnail_url = getattr(item, 'thumbnail_url', '')
             item_preview_images = getattr(item, 'preview_images', [])
             item_search_term = getattr(item, 'search_term', 'unknown')
-            
-            # Double-check for URL duplicates at download time
-            if item_url in downloaded_urls:
-                logger.warning(f"skipping duplicate URL: {item_url}")
-                continue
-                
-            logger.info(f"downloading material: {item_url}")
-            
-            # Check if this material is an image or video based on the flag we set during search
             is_image = getattr(item, 'is_image', False)
             
-            if is_image:
-                worker = WorkerThread(save_image_as_video, image_url=item_url, save_dir=material_directory, search_term=item_search_term, target_duration=max_clip_duration, video_aspect=video_aspect)
-            else:
-                worker = WorkerThread(save_video, video_url=item_url, save_dir=material_directory, search_term=item_search_term, thumbnail_url=item_thumbnail_url, preview_images=item_preview_images)
+            if item_url in downloaded_urls:
+                continue
                 
-            worker.start()
-            worker.join(timeout=60)
+            saved_video_path = ""
+            for attempt in range(max_retries + 1):
+                try:
+                    attempt_str = f" (attempt {attempt + 1}/{max_retries + 1})" if attempt > 0 else ""
+                    logger.info(f"processing material{attempt_str}: {item_url}")
+                    
+                    if is_image:
+                        worker = WorkerThread(save_image_as_video, image_url=item_url, save_dir=material_directory, search_term=item_search_term, target_duration=max_clip_duration, video_aspect=video_aspect)
+                    else:
+                        worker = WorkerThread(save_video, video_url=item_url, save_dir=material_directory, search_term=item_search_term, thumbnail_url=item_thumbnail_url, preview_images=item_preview_images)
+                        
+                    worker.start()
+                    worker.join(timeout=task_timeout)
+                    
+                    if worker.is_alive():
+                        logger.error(f"timeout ({task_timeout}s) for: {item_url}. Abandoning thread.")
+                        break # Don't retry on hard timeout as it likely indicates a stuck process
+                        
+                    if worker.exception:
+                        logger.error(f"failed: {item_url}. Error: {str(worker.exception)}")
+                        continue
+                        
+                    saved_video_path = worker.result
+                    if saved_video_path:
+                        break # Success!
+                        
+                except Exception as e:
+                    logger.error(f"unexpected error in attempt {attempt + 1}: {e}")
             
-            if worker.is_alive():
-                logger.error(f"task timeout (60s) processing material: {item_url}. Abandoning thread and moving to next.")
-                continue
-                
-            if worker.exception:
-                logger.error(f"task failed processing material: {item_url}. Error: {str(worker.exception)}")
-                continue
-                
-            saved_video_path = worker.result
-                
             if saved_video_path:
-                logger.info(f"video saved: {saved_video_path} (search_term: '{item_search_term}')")
+                logger.info(f"video saved: {saved_video_path}")
                 video_paths.append(saved_video_path)
                 downloaded_urls.add(item_url)
+                
+                # Queue metadata saving for the main thread to ensure Streamlit safety
+                deferred_metadata.append({
+                    "path": saved_video_path,
+                    "term": item_search_term,
+                    "info": {
+                        "thumbnail_url": item_thumbnail_url,
+                        "preview_images": item_preview_images
+                    }
+                })
+                
                 seconds: float = float(min(float(max_clip_duration), float(item_duration)))
-                total_duration += seconds  # type: ignore
-                if total_duration > audio_duration:
-                    logger.info(
-                        f"total duration of downloaded videos: {total_duration} seconds, skip downloading more"
-                    )
+                total_duration += seconds
+                if total_duration >= audio_duration:
+                    logger.info(f"reached required duration ({total_duration}s), stopping downloads.")
                     break
+            else:
+                logger.error(f"permanently failed to download/process: {item_url}")
+
         except Exception as e:
-            logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
+            logger.error(f"failed to download video loop: {str(e)}")
     
+    # ── Final Main-Thread Metadata Pass (Streamlit Safe) ──
+    if deferred_metadata:
+        logger.info(f"saving metadata for {len(deferred_metadata)} materials on main thread...")
+        for meta in deferred_metadata:
+            try:
+                if not semantic_video.load_video_metadata(meta["path"]):
+                    semantic_video.save_video_metadata(meta["path"], meta["term"], meta["info"])
+            except Exception as e:
+                logger.debug(f"secondary metadata save failed (non-critical): {e}")
+
     # Final diversity report
     logger.success(f"downloaded {len(video_paths)} videos")
     logger.info(f"🎯 Final diversity: {len(downloaded_urls)} unique URLs downloaded")
